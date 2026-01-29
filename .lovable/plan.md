@@ -1,50 +1,135 @@
 
-# Merge Sales Call Analysis into Mirror Room
 
-This plan will add the sales call analysis feature as a new module within your existing Mirror Room project on Vercel.
+# Migration Guide: Sales Call Analysis Feature to Mirror Room
+
+This guide covers everything you need to copy from this Lovable project to your existing Mirror Room Next.js project.
 
 ---
 
 ## Overview
 
-We'll export the core components, utilities, and edge functions from this project so you can integrate them into Mirror Room. The main consideration is that Mirror Room uses Clerk for authentication while this project uses Supabase Auth - we'll need to adapt the code to work with Clerk.
+You'll be migrating a complete sales call analysis feature that:
+- Uploads audio files (with automatic compression for large files)
+- Transcribes audio using Google Gemini AI
+- Analyzes calls using sales psychology frameworks (Cialdini, Pitch Anything, etc.)
+- Shows detailed analysis with actionable insights
 
 ---
 
-## What You'll Get
+## Files to Copy
 
-A new section in Mirror Room with:
-- Upload interface for sales call recordings
-- Background transcription with progress tracking
-- AI-powered analysis using your Google Gemini API key
-- Dashboard showing call history and analytics
-- Detailed analysis view with sales psychology frameworks
+### 1. React Components & Pages (7 files)
+
+| Source File | Where to Put in Next.js |
+|-------------|-------------------------|
+| `src/pages/UploadCall.tsx` | `app/upload/page.tsx` or `pages/upload.tsx` |
+| `src/pages/CallHistory.tsx` | `app/history/page.tsx` or `pages/history.tsx` |
+| `src/pages/AnalysisView.tsx` | `app/analysis/[callId]/page.tsx` or `pages/analysis/[callId].tsx` |
+| `src/pages/Dashboard.tsx` | `app/dashboard/page.tsx` or integrate into existing |
+| `src/components/TranscriptionProgress.tsx` | `components/TranscriptionProgress.tsx` |
+| `src/contexts/TranscriptionContext.tsx` | `contexts/TranscriptionContext.tsx` |
+| `src/components/layout/DashboardLayout.tsx` | `components/layout/DashboardLayout.tsx` (or adapt to your existing layout) |
+
+### 2. Utility Files (1 file)
+
+| Source File | Where to Put |
+|-------------|--------------|
+| `src/lib/audioCompression.ts` | `lib/audioCompression.ts` |
+
+### 3. Supabase Edge Functions (2 folders)
+
+| Source Folder | Deploy to Mirror Room's Supabase |
+|---------------|----------------------------------|
+| `supabase/functions/transcribe-audio/` | Same path in your Supabase project |
+| `supabase/functions/analyze-call/` | Same path in your Supabase project |
 
 ---
 
-## Integration Strategy
+## Changes Required for Next.js + Clerk
 
-### Option A: Single Database (Recommended)
-Use Mirror Room's existing Supabase database and add the new tables there. This keeps everything in one place.
+Since Mirror Room uses Next.js and Clerk instead of Supabase Auth, you'll need to make these modifications:
 
-### Option B: Separate Database
-Keep this Lovable Cloud database and connect Mirror Room to it. This means maintaining two databases.
+### Authentication Changes
 
-**Recommendation**: Option A is simpler for long-term maintenance.
+**Replace Supabase Auth imports with Clerk:**
+
+```tsx
+// BEFORE (Lovable/Supabase Auth)
+import { useAuth } from '@/hooks/useAuth';
+const { user } = useAuth();
+
+// AFTER (Clerk)
+import { useUser } from '@clerk/nextjs';
+const { user, isLoaded } = useUser();
+```
+
+**User ID mapping:**
+- Supabase uses UUID: `user.id`
+- Clerk uses string: `user.id`
+
+The database tables use `user_id TEXT` to work with Clerk.
+
+### Supabase Client Changes
+
+**Create a Clerk-aware Supabase client:**
+
+```tsx
+// lib/supabase.ts
+import { createClient } from '@supabase/supabase-js';
+import { useAuth } from '@clerk/nextjs';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Hook for authenticated requests
+export function useSupabaseClient() {
+  const { getToken } = useAuth();
+  
+  const getAuthenticatedClient = async () => {
+    const token = await getToken({ template: 'supabase' });
+    return createClient(supabaseUrl, supabaseAnonKey, {
+      global: {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    });
+  };
+  
+  return { supabase, getAuthenticatedClient };
+}
+```
+
+### Router Changes
+
+**Replace react-router-dom with Next.js router:**
+
+```tsx
+// BEFORE (React Router)
+import { useNavigate, useParams, Link } from 'react-router-dom';
+const navigate = useNavigate();
+navigate('/analysis/' + id);
+
+// AFTER (Next.js)
+import { useRouter, useParams } from 'next/navigation';
+import Link from 'next/link';
+const router = useRouter();
+router.push('/analysis/' + id);
+```
 
 ---
 
-## Step-by-Step Process
+## Database Setup
 
-### Step 1: Export Database Schema
+### SQL Migration (run in Supabase SQL Editor)
 
-Run these SQL migrations in Mirror Room's Supabase database to add the required tables:
-
-```text
--- Table for storing uploaded call recordings
-CREATE TABLE sales_calls (
+```sql
+-- Create sales_calls table
+CREATE TABLE IF NOT EXISTS public.sales_calls (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id TEXT NOT NULL,  -- Changed from UUID to TEXT for Clerk user IDs
+  user_id TEXT NOT NULL,
   file_path TEXT NOT NULL,
   file_name TEXT NOT NULL,
   client_name TEXT,
@@ -55,11 +140,11 @@ CREATE TABLE sales_calls (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Table for storing AI analysis results
-CREATE TABLE call_analyses (
+-- Create call_analyses table  
+CREATE TABLE IF NOT EXISTS public.call_analyses (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  call_id UUID NOT NULL REFERENCES sales_calls(id) ON DELETE CASCADE,
-  user_id TEXT NOT NULL,  -- Changed from UUID to TEXT for Clerk user IDs
+  call_id UUID NOT NULL REFERENCES public.sales_calls(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
   transcript TEXT,
   outcome TEXT NOT NULL,
   outcome_score INTEGER,
@@ -78,172 +163,123 @@ CREATE TABLE call_analyses (
 );
 
 -- Enable RLS
-ALTER TABLE sales_calls ENABLE ROW LEVEL SECURITY;
-ALTER TABLE call_analyses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sales_calls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.call_analyses ENABLE ROW LEVEL SECURITY;
 
--- RLS policies (using Clerk user IDs from JWT)
-CREATE POLICY "Users can manage their own calls"
-  ON sales_calls FOR ALL
-  USING (user_id = auth.jwt()->>'sub')
-  WITH CHECK (user_id = auth.jwt()->>'sub');
+-- RLS Policies for Clerk JWT (using sub claim)
+CREATE POLICY "Users can view own calls" ON public.sales_calls
+  FOR SELECT USING (user_id = auth.jwt()->>'sub');
 
-CREATE POLICY "Users can manage their own analyses"
-  ON call_analyses FOR ALL
-  USING (user_id = auth.jwt()->>'sub')
-  WITH CHECK (user_id = auth.jwt()->>'sub');
+CREATE POLICY "Users can insert own calls" ON public.sales_calls
+  FOR INSERT WITH CHECK (user_id = auth.jwt()->>'sub');
+
+CREATE POLICY "Users can update own calls" ON public.sales_calls
+  FOR UPDATE USING (user_id = auth.jwt()->>'sub');
+
+CREATE POLICY "Users can delete own calls" ON public.sales_calls
+  FOR DELETE USING (user_id = auth.jwt()->>'sub');
+
+CREATE POLICY "Users can view own analyses" ON public.call_analyses
+  FOR SELECT USING (user_id = auth.jwt()->>'sub');
+
+CREATE POLICY "Users can insert own analyses" ON public.call_analyses
+  FOR INSERT WITH CHECK (user_id = auth.jwt()->>'sub');
+
+-- Create storage bucket for recordings
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('call-recordings', 'call-recordings', false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Storage RLS policies
+CREATE POLICY "Users can upload own recordings" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'call-recordings' 
+    AND (storage.foldername(name))[1] = auth.jwt()->>'sub'
+  );
+
+CREATE POLICY "Users can read own recordings" ON storage.objects
+  FOR SELECT USING (
+    bucket_id = 'call-recordings'
+    AND (storage.foldername(name))[1] = auth.jwt()->>'sub'
+  );
 ```
-
-### Step 2: Create Storage Bucket
-
-In Mirror Room's Supabase dashboard, create a storage bucket called `call-recordings` (private).
-
-### Step 3: Add Google API Key Secret
-
-Add `GOOGLE_GEMINI_API_KEY` as a secret in Mirror Room's Supabase Edge Functions settings.
-
-### Step 4: Copy Edge Functions
-
-Copy these folders to Mirror Room's `supabase/functions/` directory:
-- `transcribe-audio/`
-- `analyze-call/`
-
-### Step 5: Copy React Components
-
-Copy these files to Mirror Room's source:
-
-**Pages:**
-- `src/pages/UploadCall.tsx` (rename as needed, e.g., `CallUpload.tsx`)
-- `src/pages/AnalysisView.tsx`
-- `src/pages/CallHistory.tsx`
-- `src/pages/Dashboard.tsx` (or merge with existing dashboard)
-
-**Components:**
-- `src/components/TranscriptionProgress.tsx`
-
-**Contexts:**
-- `src/contexts/TranscriptionContext.tsx`
-
-**Utilities:**
-- `src/lib/audioCompression.ts`
-
-### Step 6: Adapt Auth for Clerk
-
-Replace Supabase Auth with Clerk in the copied components:
-
-```text
-Before (Supabase Auth):
-import { useAuth } from '@/hooks/useAuth';
-const { user } = useAuth();
-// user.id
-
-After (Clerk):
-import { useUser } from '@clerk/clerk-react';
-const { user } = useUser();
-// user.id
-```
-
-### Step 7: Configure Supabase Client for Clerk
-
-If not already done, configure Mirror Room's Supabase client to use Clerk JWT tokens. This typically involves:
-
-```text
-// In your Supabase client configuration
-import { useAuth } from '@clerk/clerk-react';
-
-// Get Clerk's Supabase token
-const { getToken } = useAuth();
-const token = await getToken({ template: 'supabase' });
-
-// Use token with Supabase client
-const supabase = createClient(url, anonKey, {
-  global: {
-    headers: { Authorization: `Bearer ${token}` }
-  }
-});
-```
-
-### Step 8: Add Routes
-
-Add new routes to Mirror Room's router:
-
-```text
-/calls/upload → UploadCall component
-/calls/history → CallHistory component
-/calls/analysis/:callId → AnalysisView component
-```
-
-### Step 9: Add Navigation
-
-Add links to the new Call Analysis section in Mirror Room's navigation menu.
 
 ---
 
-## Files to Copy
+## Secrets to Add in Supabase
 
-| Source File | Purpose |
-|-------------|---------|
-| `src/pages/UploadCall.tsx` | Upload interface with drag-drop |
-| `src/pages/AnalysisView.tsx` | Detailed analysis results |
-| `src/pages/CallHistory.tsx` | List of past calls |
-| `src/pages/Dashboard.tsx` | Overview stats (optional) |
-| `src/components/TranscriptionProgress.tsx` | Floating progress indicator |
-| `src/contexts/TranscriptionContext.tsx` | Background job management |
-| `src/lib/audioCompression.ts` | Audio chunking utility |
-| `supabase/functions/transcribe-audio/` | Transcription edge function |
-| `supabase/functions/analyze-call/` | Analysis edge function |
+Add this secret in your Supabase project dashboard under Settings > Secrets:
+
+| Secret Name | Value |
+|-------------|-------|
+| `GOOGLE_GEMINI_API_KEY` | Your Google AI API key |
 
 ---
 
-## Dependencies to Add
+## Clerk JWT Template Setup
 
-Mirror Room may need these additional packages:
+In Clerk Dashboard, create a JWT template named `supabase`:
 
-```text
-react-dropzone (for file uploads)
+```json
+{
+  "aud": "authenticated",
+  "role": "authenticated",
+  "sub": "{{user.id}}",
+  "email": "{{user.primary_email_address}}",
+  "exp": "{{jwt.exp}}",
+  "iat": "{{jwt.iat}}"
+}
 ```
 
-Most other dependencies (like Radix UI) are likely already present if using shadcn/ui.
+**Important:** Add your Supabase JWT secret as the signing key in Clerk.
 
 ---
 
-## Important Considerations
+## NPM Dependency to Install
 
-### Authentication Mapping
-- This project uses Supabase Auth UUIDs for `user_id`
-- Mirror Room uses Clerk string IDs
-- The schema above uses `TEXT` for user_id to accommodate Clerk IDs
-
-### Edge Function Authentication
-- Edge functions use `SUPABASE_SERVICE_ROLE_KEY` to bypass RLS
-- They verify the call belongs to the user before processing
-- No changes needed for Clerk compatibility in edge functions
-
-### Storage Access
-- Storage policies should allow authenticated users to upload to their own folder
-- Pattern: `{userId}/{filename}`
+```bash
+npm install react-dropzone
+```
 
 ---
 
-## Alternative: Embed as Iframe
+## Step-by-Step Checklist
 
-If deep integration is too complex, you could:
-1. Deploy this app separately on Lovable
-2. Embed it as an iframe within Mirror Room
-3. Pass authentication tokens between apps
-
-This is faster but provides a less seamless experience.
+1. [ ] Run the SQL migration in your Supabase project
+2. [ ] Add `GOOGLE_GEMINI_API_KEY` secret in Supabase
+3. [ ] Create storage bucket `call-recordings` if not exists
+4. [ ] Set up Clerk JWT template for Supabase
+5. [ ] Install `react-dropzone`: `npm install react-dropzone`
+6. [ ] Copy `audioCompression.ts` to `lib/`
+7. [ ] Copy `TranscriptionContext.tsx` to `contexts/` (update imports)
+8. [ ] Copy `TranscriptionProgress.tsx` to `components/` (update imports)
+9. [ ] Copy edge functions to `supabase/functions/`
+10. [ ] Deploy edge functions: `supabase functions deploy`
+11. [ ] Create/adapt pages for Upload, History, Analysis
+12. [ ] Update all `useAuth` to `useUser` from Clerk
+13. [ ] Update all router imports to Next.js
+14. [ ] Wrap your app with `TranscriptionProvider`
+15. [ ] Add `TranscriptionProgress` component to your layout
+16. [ ] Test the full upload and analysis flow
 
 ---
 
-## Next Steps
+## Technical Details
 
-1. **Choose integration approach** (full merge vs iframe)
-2. If full merge:
-   - Run the database migrations in Mirror Room's Supabase
-   - Copy the files listed above
-   - Adapt auth calls from Supabase to Clerk
-   - Add routes and navigation
-3. Deploy edge functions to Mirror Room's Supabase project
-4. Test the full flow
+### Audio Processing Flow
 
-Would you like me to prepare a downloadable package of all the files you need to copy, or help with any specific step of this integration?
+1. User drops audio file (up to 100MB)
+2. Files >10MB are compressed client-side to 16kHz mono WAV
+3. Large files are chunked into ~4MB segments
+4. Each chunk is uploaded to Supabase Storage
+5. `transcribe-audio` edge function processes chunks sequentially
+6. Full transcript is sent to `analyze-call` for AI analysis
+7. Results stored in `call_analyses` table
+
+### Edge Function Memory Limits
+
+The edge functions are designed to handle files within Supabase's memory constraints:
+- Maximum segment size: 5MB
+- Chunks are processed one at a time to avoid memory issues
+- Base64 encoding adds ~33% overhead (4MB file becomes ~5.3MB encoded)
+
