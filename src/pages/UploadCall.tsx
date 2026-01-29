@@ -104,8 +104,8 @@ export default function UploadCall() {
           file,
           (prog) => setCompressionProgress(prog),
           {
-            // keep comfortably under backend processing limits
-            targetBytes: MAX_SIZE_FOR_DIRECT_UPLOAD - 512 * 1024,
+            // 6MB chunks → ~8MB after Base64 encoding, safely under provider limits
+            targetBytes: 6 * 1024 * 1024,
             sampleRate: 16000,
           }
         );

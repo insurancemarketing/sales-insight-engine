@@ -4,7 +4,7 @@
 // 3) Split PCM into multiple small WAV chunks (each < ~10MB)
 
 const DEFAULT_SAMPLE_RATE = 16000;
-const DEFAULT_TARGET_BYTES = 9 * 1024 * 1024; // keep safely under 10MB
+const DEFAULT_TARGET_BYTES = 6 * 1024 * 1024; // 6MB to stay under limits after Base64 encoding (~8MB)
 
 export type PreparedAudio =
   | { kind: 'single'; file: File; sampleRate: number }

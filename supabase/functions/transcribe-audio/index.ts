@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.4";
 
 const corsHeaders = {
@@ -93,19 +94,17 @@ serve(async (req) => {
       const fileSize = fileData.size;
       console.log('Segment downloaded, size:', fileSize, 'bytes');
 
-      if (fileSize > 10 * 1024 * 1024) {
-        throw new Error('One of the audio segments is too large. Please try again.');
+      // 7MB limit to account for ~33% Base64 expansion (7MB → ~9.3MB encoded)
+      const MAX_SEGMENT_BYTES = 7 * 1024 * 1024;
+      if (fileSize > MAX_SEGMENT_BYTES) {
+        throw new Error(`Segment too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max allowed is 7MB. Please re-upload with smaller chunks.`);
       }
 
       const arrayBuffer = await fileData.arrayBuffer();
-      const uint8Array = new Uint8Array(arrayBuffer);
 
-      let base64Audio = '';
-      const chunkSize = 32768;
-      for (let i = 0; i < uint8Array.length; i += chunkSize) {
-        const chunk = uint8Array.slice(i, Math.min(i + chunkSize, uint8Array.length));
-        base64Audio += btoa(String.fromCharCode(...chunk));
-      }
+      // Use proper Base64 encoder to avoid broken padding from chunked btoa
+      const base64Audio = base64Encode(arrayBuffer);
+      console.log('Base64 encoded length:', base64Audio.length, 'chars');
 
       const extension = currentPath.split('.').pop()?.toLowerCase() || 'mp3';
       const format = formatMap[extension] || 'mp3';
@@ -155,7 +154,18 @@ serve(async (req) => {
         if (aiResponse.status === 402) {
           throw new Error('AI credits exhausted. Please add more credits.');
         }
-        throw new Error(`Transcription failed: ${aiResponse.status}`);
+        
+        // Detect common provider errors and provide clearer messages
+        if (errorText.includes('Base64 decoding failed') || errorText.includes('invalid base64')) {
+          throw new Error('Audio encoding error. Please try re-uploading the file.');
+        }
+        if (aiResponse.status === 413 || errorText.includes('too large')) {
+          throw new Error('Audio segment too large for processing. Please try a shorter recording.');
+        }
+        
+        // Include snippet of error for debugging
+        const snippet = errorText.length > 200 ? errorText.substring(0, 200) + '...' : errorText;
+        throw new Error(`Transcription failed (${aiResponse.status}): ${snippet}`);
       }
 
       const aiData = await aiResponse.json();
