@@ -22,9 +22,9 @@ serve(async (req) => {
       );
     }
 
-    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-    if (!LOVABLE_API_KEY) {
-      throw new Error('LOVABLE_API_KEY is not configured');
+    const GOOGLE_GEMINI_API_KEY = Deno.env.get('GOOGLE_GEMINI_API_KEY');
+    if (!GOOGLE_GEMINI_API_KEY) {
+      throw new Error('GOOGLE_GEMINI_API_KEY is not configured. Please add your Google Gemini API key in settings.');
     }
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
@@ -125,47 +125,48 @@ serve(async (req) => {
             `Provide only the transcript for this segment without any additional commentary.`
           : 'Please transcribe this audio recording word-for-word. This is a sales call recording. Format it as a conversation with speaker labels where you can distinguish speakers. Use the actual names mentioned in the conversation for speaker labels. Include all dialogue faithfully and accurately. Do not make up or invent any content - only transcribe what you actually hear in the audio. Provide only the transcript without any additional commentary.';
 
-      const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+      // Map format to proper MIME type for Google API
+      const mimeTypeMap: Record<string, string> = {
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'webm': 'audio/webm',
+        'ogg': 'audio/ogg',
+      };
+      const mimeType = mimeTypeMap[format] || 'audio/mpeg';
+
+      const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_GEMINI_API_KEY}`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${LOVABLE_API_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'google/gemini-2.5-pro',
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: segmentPrompt },
-                {
-                  type: 'input_audio',
-                  input_audio: { data: base64Audio, format },
-                },
-              ],
-            },
-          ],
-          temperature: 0.1,
+          contents: [{
+            parts: [
+              { text: segmentPrompt },
+              { inlineData: { mimeType, data: base64Audio } }
+            ]
+          }],
+          generationConfig: {
+            temperature: 0.1
+          }
         }),
       });
 
       if (!aiResponse.ok) {
         const errorText = await aiResponse.text();
-        console.error('AI Gateway error:', aiResponse.status, errorText);
+        console.error('Google Gemini API error:', aiResponse.status, errorText);
 
         if (aiResponse.status === 429) {
-          throw new Error('Rate limit exceeded. Please try again later.');
+          throw new Error('Rate limit exceeded. Please try again later or check your Google API quota.');
         }
-        if (aiResponse.status === 402) {
-          throw new Error('AI credits exhausted. Please add more credits.');
+        if (aiResponse.status === 403) {
+          throw new Error('Invalid API key. Please check your GOOGLE_GEMINI_API_KEY.');
         }
-        
-        // Detect common provider errors and provide clearer messages
-        if (errorText.includes('Base64 decoding failed') || errorText.includes('invalid base64')) {
-          throw new Error('Audio encoding error. Please try re-uploading the file.');
-        }
-        if (aiResponse.status === 413 || errorText.includes('too large')) {
-          throw new Error('Audio segment too large for processing. Please try a shorter recording.');
+        if (aiResponse.status === 400) {
+          if (errorText.includes('INVALID_ARGUMENT')) {
+            throw new Error('Audio format not supported or file too large. Please try a different format.');
+          }
+          throw new Error('Invalid request. Please try re-uploading the file.');
         }
         
         // Include snippet of error for debugging
@@ -174,8 +175,10 @@ serve(async (req) => {
       }
 
       const aiData = await aiResponse.json();
-      const segmentTranscript = aiData.choices?.[0]?.message?.content;
+      // Google's native API response structure
+      const segmentTranscript = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!segmentTranscript) {
+        console.error('Unexpected response structure:', JSON.stringify(aiData).substring(0, 500));
         throw new Error('No transcript received from AI');
       }
       transcripts.push(String(segmentTranscript).trim());
