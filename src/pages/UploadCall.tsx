@@ -104,8 +104,8 @@ export default function UploadCall() {
           file,
           (prog) => setCompressionProgress(prog),
           {
-            // 6MB chunks → ~8MB after Base64 encoding, safely under provider limits
-            targetBytes: 6 * 1024 * 1024,
+            // 4MB chunks → ~5.3MB after Base64, avoids edge function memory limits
+            targetBytes: 4 * 1024 * 1024,
             sampleRate: 16000,
           }
         );

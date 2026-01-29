@@ -94,10 +94,10 @@ serve(async (req) => {
       const fileSize = fileData.size;
       console.log('Segment downloaded, size:', fileSize, 'bytes');
 
-      // 7MB limit to account for ~33% Base64 expansion (7MB → ~9.3MB encoded)
-      const MAX_SEGMENT_BYTES = 7 * 1024 * 1024;
+      // 5MB limit to stay within edge function memory constraints
+      const MAX_SEGMENT_BYTES = 5 * 1024 * 1024;
       if (fileSize > MAX_SEGMENT_BYTES) {
-        throw new Error(`Segment too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max allowed is 7MB. Please re-upload with smaller chunks.`);
+        throw new Error(`Segment too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max allowed is 5MB. Please re-upload with smaller chunks.`);
       }
 
       const arrayBuffer = await fileData.arrayBuffer();
