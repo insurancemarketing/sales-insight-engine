@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useDropzone } from 'react-dropzone';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
+import { useTranscription } from '@/contexts/TranscriptionContext';
 import { DashboardLayout } from '@/components/layout/DashboardLayout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -24,7 +25,7 @@ import {
 import { cn } from '@/lib/utils';
 import { prepareAudio, formatFileSize } from '@/lib/audioCompression';
 
-type UploadStep = 'upload' | 'details' | 'compressing' | 'processing' | 'complete' | 'error';
+type UploadStep = 'upload' | 'details' | 'compressing' | 'uploading' | 'processing' | 'complete' | 'error';
 
 const MAX_SIZE_FOR_DIRECT_UPLOAD = 10 * 1024 * 1024; // 10MB
 const MAX_SIZE_FOR_COMPRESSION = 100 * 1024 * 1024; // 100MB
@@ -33,6 +34,7 @@ export default function UploadCall() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { startJob } = useTranscription();
   
   const [step, setStep] = useState<UploadStep>('upload');
   const [file, setFile] = useState<File | null>(null);
@@ -169,7 +171,7 @@ export default function UploadCall() {
         }
       }
 
-      setStep('processing');
+      setStep('uploading');
       setProgress(0);
 
       // Step 1: Upload file to storage (direct path)
@@ -185,7 +187,7 @@ export default function UploadCall() {
         if (uploadError) throw uploadError;
       }
 
-      setProgress(30);
+      setProgress(50);
 
       // Step 2: Create call record
       const { data: callData, error: callError } = await supabase
@@ -195,82 +197,73 @@ export default function UploadCall() {
           file_path: filePath,
           file_name: originalFile?.name || file.name,
           client_name: clientName || null,
-          status: 'pending',
+          status: 'processing',
         })
         .select()
         .single();
 
       if (callError) throw callError;
       setCallId(callData.id);
-
-      setProgress(50);
-
-      // Step 3: Transcribe the audio
-      const invokeTranscribe = async (body: any) => {
-        const { data, error } = await supabase.functions.invoke('transcribe-audio', { body });
-        if (error || data?.error) {
-          throw new Error(data?.error || error?.message || 'Transcription failed');
-        }
-        return data as { transcript: string };
-      };
-
-      const invokeTranscribeWithRetry = async (body: any, attempts = 2) => {
-        let lastErr: unknown;
-        for (let i = 0; i <= attempts; i++) {
-          try {
-            return await invokeTranscribe(body);
-          } catch (err) {
-            lastErr = err;
-            // brief backoff for transient worker/rate-limit errors
-            await new Promise((r) => setTimeout(r, 700 * (i + 1)));
-          }
-        }
-        throw lastErr instanceof Error ? lastErr : new Error('Transcription failed');
-      };
-
-      let transcript: string;
-
-      if (chunkPathsForTranscription && chunkPathsForTranscription.length > 0) {
-        const parts: string[] = [];
-        const total = chunkPathsForTranscription.length;
-        for (let i = 0; i < total; i++) {
-          // keep progress within the 50..75 band during transcription
-          const pct = 50 + Math.round(((i + 0.2) / total) * 25);
-          setProgress(Math.min(74, pct));
-
-          const segmentPath = chunkPathsForTranscription[i];
-          const segmentData = await invokeTranscribeWithRetry({
-            callId: callData.id,
-            filePaths: [segmentPath],
-            segmentIndex: i,
-            segmentsTotal: total,
-          });
-          parts.push(String(segmentData.transcript || '').trim());
-        }
-        transcript = parts.filter(Boolean).join('\n\n');
-      } else {
-        const transcribeData = await invokeTranscribeWithRetry({ callId: callData.id, filePath });
-        transcript = String(transcribeData.transcript || '').trim();
-      }
-
       setProgress(75);
 
-      // Step 4: Analyze the transcript
-      const { data: analyzeData, error: analyzeError } = await supabase.functions.invoke('analyze-call', {
-        body: { callId: callData.id, transcript },
-      });
+      // Step 3: Hand off to background transcription context
+      if (chunkPathsForTranscription && chunkPathsForTranscription.length > 0) {
+        // Multiple chunks - use background context so user can navigate
+        startJob({
+          callId: callData.id,
+          fileName: originalFile?.name || file.name,
+          chunkPaths: chunkPathsForTranscription,
+          onComplete: () => {
+            // Job completed - user will see floating progress indicator
+          },
+          onError: (errMsg) => {
+            console.error('Background transcription failed:', errMsg);
+          },
+        });
 
-      if (analyzeError || analyzeData?.error) {
-        throw new Error(analyzeData?.error || 'Analysis failed');
+        toast({
+          title: 'Processing started!',
+          description: 'You can navigate away—progress will show in the corner.',
+        });
+
+        // Allow user to navigate immediately
+        setStep('processing');
+        // After a brief moment, redirect or show they can leave
+        setTimeout(() => {
+          navigate('/');
+        }, 1500);
+      } else {
+        // Single file / small - do inline for quick completion
+        setStep('processing');
+        
+        const { data: transcribeData, error: transcribeError } = await supabase.functions.invoke(
+          'transcribe-audio',
+          { body: { callId: callData.id, filePath } }
+        );
+
+        if (transcribeError || transcribeData?.error) {
+          throw new Error(transcribeData?.error || 'Transcription failed');
+        }
+
+        setProgress(85);
+
+        const { data: analyzeData, error: analyzeError } = await supabase.functions.invoke(
+          'analyze-call',
+          { body: { callId: callData.id, transcript: transcribeData.transcript } }
+        );
+
+        if (analyzeError || analyzeData?.error) {
+          throw new Error(analyzeData?.error || 'Analysis failed');
+        }
+
+        setProgress(100);
+        setStep('complete');
+
+        toast({
+          title: 'Analysis complete!',
+          description: 'Your call has been analyzed successfully.',
+        });
       }
-
-      setProgress(100);
-      setStep('complete');
-
-      toast({
-        title: 'Analysis complete!',
-        description: 'Your call has been analyzed successfully.',
-      });
 
     } catch (err) {
       console.error('Upload error:', err);
@@ -455,6 +448,26 @@ export default function UploadCall() {
           </Card>
         )}
 
+        {step === 'uploading' && (
+          <Card>
+            <CardContent className="pt-8 pb-8">
+              <div className="text-center">
+                <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-6">
+                  <Upload className="w-8 h-8 text-primary animate-pulse" />
+                </div>
+                <h3 className="text-xl font-display font-semibold mb-2">
+                  Uploading recording...
+                </h3>
+                <p className="text-muted-foreground mb-6">
+                  Preparing your file for analysis
+                </p>
+                <Progress value={progress} className="h-2" />
+                <p className="text-sm text-muted-foreground mt-2">{progress}%</p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {step === 'processing' && (
           <Card>
             <CardContent className="pt-8 pb-8">
@@ -463,16 +476,17 @@ export default function UploadCall() {
                   <Loader2 className="w-8 h-8 text-primary animate-spin" />
                 </div>
                 <h3 className="text-xl font-display font-semibold mb-2">
-                  Analyzing your call...
+                  Processing in background...
                 </h3>
-                <p className="text-muted-foreground mb-6">
-                  {progress < 30 && 'Uploading recording...'}
-                  {progress >= 30 && progress < 50 && 'Creating call record...'}
-                  {progress >= 50 && progress < 75 && 'Transcribing audio...'}
-                  {progress >= 75 && 'Running AI analysis...'}
+                <p className="text-muted-foreground mb-4">
+                  Transcription and analysis are running. You can navigate away!
                 </p>
-                <Progress value={progress} className="h-2" />
-                <p className="text-sm text-muted-foreground mt-2">{progress}%</p>
+                <p className="text-sm text-muted-foreground mb-6">
+                  Check the progress indicator in the bottom-right corner.
+                </p>
+                <Button variant="outline" onClick={() => navigate('/')}>
+                  Go to Dashboard
+                </Button>
               </div>
             </CardContent>
           </Card>
