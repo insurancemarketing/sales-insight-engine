@@ -37,12 +37,23 @@ export default function UploadCall() {
   const [callId, setCallId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
+  const onDrop = useCallback((acceptedFiles: File[], rejectedFiles: any[]) => {
+    if (rejectedFiles.length > 0) {
+      const rejection = rejectedFiles[0];
+      if (rejection.errors?.some((e: any) => e.code === 'file-too-large')) {
+        toast({
+          variant: 'destructive',
+          title: 'File too large',
+          description: 'Please upload audio files under 10MB. Try compressing or trimming your recording.',
+        });
+      }
+      return;
+    }
     if (acceptedFiles.length > 0) {
       setFile(acceptedFiles[0]);
       setStep('details');
     }
-  }, []);
+  }, [toast]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -50,7 +61,7 @@ export default function UploadCall() {
       'audio/*': ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4'],
     },
     maxFiles: 1,
-    maxSize: 100 * 1024 * 1024, // 100MB
+    maxSize: 10 * 1024 * 1024, // 10MB limit due to edge function constraints
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -158,7 +169,7 @@ export default function UploadCall() {
             <CardHeader>
               <CardTitle className="font-display">Select Recording</CardTitle>
               <CardDescription>
-                Supported formats: MP3, WAV, M4A, OGG, WebM (max 100MB)
+                Supported formats: MP3, WAV, M4A, OGG, WebM (max 10MB)
               </CardDescription>
             </CardHeader>
             <CardContent>
