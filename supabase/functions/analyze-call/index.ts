@@ -161,9 +161,9 @@ serve(async (req) => {
       );
     }
 
-    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-    if (!LOVABLE_API_KEY) {
-      throw new Error('LOVABLE_API_KEY is not configured');
+    const GOOGLE_GEMINI_API_KEY = Deno.env.get('GOOGLE_GEMINI_API_KEY');
+    if (!GOOGLE_GEMINI_API_KEY) {
+      throw new Error('GOOGLE_GEMINI_API_KEY is not configured. Please add your Google Gemini API key in settings.');
     }
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
@@ -178,38 +178,40 @@ serve(async (req) => {
 
     console.log('Starting AI analysis for call:', callId);
 
-    // Call Lovable AI for analysis
-    const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+    // Call Google Gemini API directly for analysis
+    const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_GEMINI_API_KEY}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'google/gemini-2.5-pro',
-        messages: [
-          { role: 'system', content: ANALYSIS_PROMPT },
-          { role: 'user', content: `Analyze this sales call transcript:\n\n${transcript}` }
+        contents: [
+          { role: 'user', parts: [{ text: ANALYSIS_PROMPT }] },
+          { role: 'model', parts: [{ text: 'Understood. I will analyze the sales call transcript and return a detailed JSON analysis based on the frameworks you provided.' }] },
+          { role: 'user', parts: [{ text: `Analyze this sales call transcript:\n\n${transcript}` }] }
         ],
-        temperature: 0.3,
+        generationConfig: {
+          temperature: 0.3
+        }
       }),
     });
 
     if (!aiResponse.ok) {
       const errorText = await aiResponse.text();
-      console.error('AI Gateway error:', aiResponse.status, errorText);
+      console.error('Google Gemini API error:', aiResponse.status, errorText);
       
       if (aiResponse.status === 429) {
-        throw new Error('Rate limit exceeded. Please try again later.');
+        throw new Error('Rate limit exceeded. Please try again later or check your Google API quota.');
       }
-      if (aiResponse.status === 402) {
-        throw new Error('AI credits exhausted. Please add more credits.');
+      if (aiResponse.status === 403) {
+        throw new Error('Invalid API key. Please check your GOOGLE_GEMINI_API_KEY.');
       }
       throw new Error(`AI analysis failed: ${aiResponse.status}`);
     }
 
     const aiData = await aiResponse.json();
-    const analysisText = aiData.choices?.[0]?.message?.content;
+    // Google's native API response structure
+    const analysisText = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!analysisText) {
       throw new Error('No analysis received from AI');
