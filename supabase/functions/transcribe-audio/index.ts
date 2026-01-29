@@ -13,7 +13,7 @@ serve(async (req) => {
   }
 
   try {
-    const { callId, filePath, filePaths } = await req.json();
+    const { callId, filePath, filePaths, segmentIndex, segmentsTotal } = await req.json();
 
     if (!callId || (!filePath && (!Array.isArray(filePaths) || filePaths.length === 0))) {
       return new Response(
@@ -111,9 +111,14 @@ serve(async (req) => {
 
       console.log('Sending segment to AI for transcription, format:', format);
 
+      const effectiveTotal =
+        typeof segmentsTotal === 'number' && segmentsTotal > 0 ? segmentsTotal : paths.length;
+      const effectiveIndex =
+        typeof segmentIndex === 'number' && segmentIndex >= 0 ? segmentIndex : idx;
+
       const segmentPrompt =
-        paths.length > 1
-          ? `This is segment ${idx + 1} of ${paths.length} from a single sales call recording. ` +
+        effectiveTotal > 1
+          ? `This is segment ${effectiveIndex + 1} of ${effectiveTotal} from a single sales call recording. ` +
             `Please transcribe this segment word-for-word. Format it as a conversation with speaker labels where you can distinguish speakers. ` +
             `Use the actual names mentioned in the conversation for speaker labels. ` +
             `Do not repeat earlier segments; just continue the transcript from this segment. ` +

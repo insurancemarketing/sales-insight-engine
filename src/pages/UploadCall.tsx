@@ -87,6 +87,7 @@ export default function UploadCall() {
     if (!file || !user) return;
 
     let filePath: string;
+    let chunkPathsForTranscription: string[] | null = null;
     const baseId = Date.now();
 
     try {
@@ -140,6 +141,9 @@ export default function UploadCall() {
             const pct = 70 + Math.round(((i + 1) / prepared.chunks.length) * 25);
             setCompressionProgress(pct);
           }
+
+          // Keep the uploaded chunk list so we can transcribe per-chunk (avoids WORKER_LIMIT).
+          chunkPathsForTranscription = chunkPaths;
 
           const manifest = {
             version: 1,
@@ -202,19 +206,58 @@ export default function UploadCall() {
       setProgress(50);
 
       // Step 3: Transcribe the audio
-      const { data: transcribeData, error: transcribeError } = await supabase.functions.invoke('transcribe-audio', {
-        body: { callId: callData.id, filePath },
-      });
+      const invokeTranscribe = async (body: any) => {
+        const { data, error } = await supabase.functions.invoke('transcribe-audio', { body });
+        if (error || data?.error) {
+          throw new Error(data?.error || error?.message || 'Transcription failed');
+        }
+        return data as { transcript: string };
+      };
 
-      if (transcribeError || transcribeData?.error) {
-        throw new Error(transcribeData?.error || 'Transcription failed');
+      const invokeTranscribeWithRetry = async (body: any, attempts = 2) => {
+        let lastErr: unknown;
+        for (let i = 0; i <= attempts; i++) {
+          try {
+            return await invokeTranscribe(body);
+          } catch (err) {
+            lastErr = err;
+            // brief backoff for transient worker/rate-limit errors
+            await new Promise((r) => setTimeout(r, 700 * (i + 1)));
+          }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error('Transcription failed');
+      };
+
+      let transcript: string;
+
+      if (chunkPathsForTranscription && chunkPathsForTranscription.length > 0) {
+        const parts: string[] = [];
+        const total = chunkPathsForTranscription.length;
+        for (let i = 0; i < total; i++) {
+          // keep progress within the 50..75 band during transcription
+          const pct = 50 + Math.round(((i + 0.2) / total) * 25);
+          setProgress(Math.min(74, pct));
+
+          const segmentPath = chunkPathsForTranscription[i];
+          const segmentData = await invokeTranscribeWithRetry({
+            callId: callData.id,
+            filePaths: [segmentPath],
+            segmentIndex: i,
+            segmentsTotal: total,
+          });
+          parts.push(String(segmentData.transcript || '').trim());
+        }
+        transcript = parts.filter(Boolean).join('\n\n');
+      } else {
+        const transcribeData = await invokeTranscribeWithRetry({ callId: callData.id, filePath });
+        transcript = String(transcribeData.transcript || '').trim();
       }
 
       setProgress(75);
 
       // Step 4: Analyze the transcript
       const { data: analyzeData, error: analyzeError } = await supabase.functions.invoke('analyze-call', {
-        body: { callId: callData.id, transcript: transcribeData.transcript },
+        body: { callId: callData.id, transcript },
       });
 
       if (analyzeError || analyzeData?.error) {
