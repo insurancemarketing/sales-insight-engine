@@ -12,9 +12,9 @@ serve(async (req) => {
   }
 
   try {
-    const { callId, filePath } = await req.json();
+    const { callId, filePath, filePaths } = await req.json();
 
-    if (!callId || !filePath) {
+    if (!callId || (!filePath && (!Array.isArray(filePaths) || filePaths.length === 0))) {
       return new Response(
         JSON.stringify({ error: 'Missing callId or filePath' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -30,105 +30,143 @@ serve(async (req) => {
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    console.log('Downloading audio file:', filePath);
-
-    // Download the audio file from storage
-    const { data: fileData, error: downloadError } = await supabase.storage
-      .from('call-recordings')
-      .download(filePath);
-
-    if (downloadError || !fileData) {
-      console.error('Failed to download file:', downloadError);
-      throw new Error('Failed to download audio file');
-    }
-
-    const fileSize = fileData.size;
-    console.log('File downloaded, size:', fileSize, 'bytes');
-
-    // Check file size - edge functions have memory limits
-    // For files larger than 10MB, we need to warn
-    if (fileSize > 10 * 1024 * 1024) {
-      throw new Error('Audio file is too large. Please upload files under 10MB.');
-    }
-
-    // Convert the audio to base64 - use chunked approach to avoid memory issues
-    const arrayBuffer = await fileData.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
-    
-    // Convert to base64 in chunks to avoid memory issues
-    let base64Audio = '';
-    const chunkSize = 32768; // 32KB chunks
-    for (let i = 0; i < uint8Array.length; i += chunkSize) {
-      const chunk = uint8Array.slice(i, Math.min(i + chunkSize, uint8Array.length));
-      base64Audio += btoa(String.fromCharCode(...chunk));
-    }
-
-    console.log('Base64 encoded, length:', base64Audio.length);
-
-    // Determine format from file extension
-    const extension = filePath.split('.').pop()?.toLowerCase() || 'mp3';
     const formatMap: Record<string, string> = {
       'mp3': 'mp3',
       'wav': 'wav',
       'webm': 'webm',
-      'm4a': 'mp3', // Gemini treats m4a as mp3 format
+      'm4a': 'mp3',
       'ogg': 'ogg',
       'mp4': 'mp3',
+      'json': 'mp3',
     };
-    const format = formatMap[extension] || 'mp3';
 
-    console.log('Sending to AI for transcription, format:', format);
+    const resolvePaths = async (): Promise<string[]> => {
+      if (Array.isArray(filePaths) && filePaths.length > 0) return filePaths;
+      if (!filePath) throw new Error('Missing filePath');
 
-    // Use Gemini to transcribe with proper input_audio format
-    const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemini-2.5-pro',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: 'Please transcribe this audio recording word-for-word. This is a sales call recording. Format it as a conversation with speaker labels where you can distinguish speakers. Use the actual names mentioned in the conversation for speaker labels. Include all dialogue faithfully and accurately. Do not make up or invent any content - only transcribe what you actually hear in the audio. Provide only the transcript without any additional commentary.'
-              },
-              {
-                type: 'input_audio',
-                input_audio: {
-                  data: base64Audio,
-                  format: format
-                }
-              }
-            ]
-          }
-        ],
-        temperature: 0.1,
-      }),
-    });
+      const ext = filePath.split('.').pop()?.toLowerCase();
+      if (ext !== 'json') return [filePath];
 
-    if (!aiResponse.ok) {
-      const errorText = await aiResponse.text();
-      console.error('AI Gateway error:', aiResponse.status, errorText);
-      
-      if (aiResponse.status === 429) {
-        throw new Error('Rate limit exceeded. Please try again later.');
+      console.log('Downloading manifest:', filePath);
+      const { data: manifestData, error: manifestErr } = await supabase.storage
+        .from('call-recordings')
+        .download(filePath);
+
+      if (manifestErr || !manifestData) {
+        console.error('Failed to download manifest:', manifestErr);
+        throw new Error('Failed to download manifest');
       }
-      if (aiResponse.status === 402) {
-        throw new Error('AI credits exhausted. Please add more credits.');
+
+      const text = await manifestData.text();
+      let manifest: any;
+      try {
+        manifest = JSON.parse(text);
+      } catch {
+        throw new Error('Invalid manifest JSON');
       }
-      throw new Error(`Transcription failed: ${aiResponse.status}`);
+
+      const chunks = manifest?.chunks;
+      if (!Array.isArray(chunks) || chunks.some((p: any) => typeof p !== 'string')) {
+        throw new Error('Manifest missing valid chunks array');
+      }
+      return chunks;
+    };
+
+    const paths = await resolvePaths();
+    console.log('Transcribing segments:', paths.length);
+
+    const transcripts: string[] = [];
+
+    for (let idx = 0; idx < paths.length; idx++) {
+      const currentPath = paths[idx];
+      console.log('Downloading audio segment:', idx + 1, '/', paths.length, currentPath);
+
+      const { data: fileData, error: downloadError } = await supabase.storage
+        .from('call-recordings')
+        .download(currentPath);
+
+      if (downloadError || !fileData) {
+        console.error('Failed to download file:', downloadError);
+        throw new Error('Failed to download audio file');
+      }
+
+      const fileSize = fileData.size;
+      console.log('Segment downloaded, size:', fileSize, 'bytes');
+
+      if (fileSize > 10 * 1024 * 1024) {
+        throw new Error('One of the audio segments is too large. Please try again.');
+      }
+
+      const arrayBuffer = await fileData.arrayBuffer();
+      const uint8Array = new Uint8Array(arrayBuffer);
+
+      let base64Audio = '';
+      const chunkSize = 32768;
+      for (let i = 0; i < uint8Array.length; i += chunkSize) {
+        const chunk = uint8Array.slice(i, Math.min(i + chunkSize, uint8Array.length));
+        base64Audio += btoa(String.fromCharCode(...chunk));
+      }
+
+      const extension = currentPath.split('.').pop()?.toLowerCase() || 'mp3';
+      const format = formatMap[extension] || 'mp3';
+
+      console.log('Sending segment to AI for transcription, format:', format);
+
+      const segmentPrompt =
+        paths.length > 1
+          ? `This is segment ${idx + 1} of ${paths.length} from a single sales call recording. ` +
+            `Please transcribe this segment word-for-word. Format it as a conversation with speaker labels where you can distinguish speakers. ` +
+            `Use the actual names mentioned in the conversation for speaker labels. ` +
+            `Do not repeat earlier segments; just continue the transcript from this segment. ` +
+            `Provide only the transcript for this segment without any additional commentary.`
+          : 'Please transcribe this audio recording word-for-word. This is a sales call recording. Format it as a conversation with speaker labels where you can distinguish speakers. Use the actual names mentioned in the conversation for speaker labels. Include all dialogue faithfully and accurately. Do not make up or invent any content - only transcribe what you actually hear in the audio. Provide only the transcript without any additional commentary.';
+
+      const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'google/gemini-2.5-pro',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: segmentPrompt },
+                {
+                  type: 'input_audio',
+                  input_audio: { data: base64Audio, format },
+                },
+              ],
+            },
+          ],
+          temperature: 0.1,
+        }),
+      });
+
+      if (!aiResponse.ok) {
+        const errorText = await aiResponse.text();
+        console.error('AI Gateway error:', aiResponse.status, errorText);
+
+        if (aiResponse.status === 429) {
+          throw new Error('Rate limit exceeded. Please try again later.');
+        }
+        if (aiResponse.status === 402) {
+          throw new Error('AI credits exhausted. Please add more credits.');
+        }
+        throw new Error(`Transcription failed: ${aiResponse.status}`);
+      }
+
+      const aiData = await aiResponse.json();
+      const segmentTranscript = aiData.choices?.[0]?.message?.content;
+      if (!segmentTranscript) {
+        throw new Error('No transcript received from AI');
+      }
+      transcripts.push(String(segmentTranscript).trim());
     }
 
-    const aiData = await aiResponse.json();
-    const transcript = aiData.choices?.[0]?.message?.content;
-
-    if (!transcript) {
-      throw new Error('No transcript received from AI');
-    }
+    const transcript = transcripts.filter(Boolean).join('\n\n');
 
     console.log('Transcription completed, length:', transcript.length);
 

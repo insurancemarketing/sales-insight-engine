@@ -22,7 +22,7 @@ import {
   Zap
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { compressAudio, formatFileSize } from '@/lib/audioCompression';
+import { prepareAudio, formatFileSize } from '@/lib/audioCompression';
 
 type UploadStep = 'upload' | 'details' | 'compressing' | 'processing' | 'complete' | 'error';
 
@@ -86,7 +86,8 @@ export default function UploadCall() {
     e.preventDefault();
     if (!file || !user) return;
 
-    let fileToUpload = file;
+    let filePath: string;
+    const baseId = Date.now();
 
     try {
       // Step 0: Compress if needed
@@ -99,29 +100,86 @@ export default function UploadCall() {
           description: 'This may take a moment for large files.',
         });
 
-        fileToUpload = await compressAudio(file, (prog) => {
-          setCompressionProgress(prog);
-        });
+        const prepared = await prepareAudio(
+          file,
+          (prog) => setCompressionProgress(prog),
+          {
+            // keep comfortably under backend processing limits
+            targetBytes: MAX_SIZE_FOR_DIRECT_UPLOAD - 512 * 1024,
+            sampleRate: 16000,
+          }
+        );
 
-        toast({
-          title: 'Compression complete!',
-          description: `Reduced from ${formatFileSize(file.size)} to ${formatFileSize(fileToUpload.size)}`,
-        });
+        // Step 1: Upload prepared audio (either single WAV or chunked WAV + manifest)
+        if (prepared.kind === 'single') {
+          setCompressionProgress(85);
+
+          filePath = `${user.id}/${baseId}.wav`;
+          const { error: uploadError } = await supabase.storage
+            .from('call-recordings')
+            .upload(filePath, prepared.file);
+          if (uploadError) throw uploadError;
+
+          setCompressionProgress(100);
+          toast({
+            title: 'Audio prepared!',
+            description: `Prepared as ${formatFileSize(prepared.file.size)} WAV for processing.`,
+          });
+        } else {
+          const chunkPaths: string[] = [];
+          for (let i = 0; i < prepared.chunks.length; i++) {
+            const chunk = prepared.chunks[i];
+            const chunkPath = `${user.id}/${baseId}/${chunk.name}`;
+            const { error: uploadError } = await supabase.storage
+              .from('call-recordings')
+              .upload(chunkPath, chunk);
+            if (uploadError) throw uploadError;
+            chunkPaths.push(chunkPath);
+
+            // 70..95 while uploading chunks
+            const pct = 70 + Math.round(((i + 1) / prepared.chunks.length) * 25);
+            setCompressionProgress(pct);
+          }
+
+          const manifest = {
+            version: 1,
+            createdAt: new Date().toISOString(),
+            originalFileName: originalFile?.name || file.name,
+            sampleRate: prepared.sampleRate,
+            chunkSeconds: prepared.chunkSeconds,
+            chunks: chunkPaths,
+          };
+
+          filePath = `${user.id}/${baseId}/manifest.json`;
+          const manifestBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+          const { error: manifestError } = await supabase.storage
+            .from('call-recordings')
+            .upload(filePath, manifestBlob);
+          if (manifestError) throw manifestError;
+
+          setCompressionProgress(100);
+          toast({
+            title: 'Audio chunked & uploaded!',
+            description: `Split into ${prepared.chunks.length} parts for processing.`,
+          });
+        }
       }
 
       setStep('processing');
       setProgress(0);
 
-      // Step 1: Upload file to storage
-      setProgress(10);
-      const fileExt = fileToUpload.name.split('.').pop();
-      const filePath = `${user.id}/${Date.now()}.${fileExt}`;
+      // Step 1: Upload file to storage (direct path)
+      if (!needsCompression) {
+        setProgress(10);
+        const fileExt = file.name.split('.').pop() || 'mp3';
+        filePath = `${user.id}/${baseId}.${fileExt}`;
 
-      const { error: uploadError } = await supabase.storage
-        .from('call-recordings')
-        .upload(filePath, fileToUpload);
+        const { error: uploadError } = await supabase.storage
+          .from('call-recordings')
+          .upload(filePath, file);
 
-      if (uploadError) throw uploadError;
+        if (uploadError) throw uploadError;
+      }
 
       setProgress(30);
 
