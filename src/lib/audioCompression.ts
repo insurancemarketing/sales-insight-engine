@@ -1,85 +1,108 @@
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
-
-let ffmpeg: FFmpeg | null = null;
-
-export async function loadFFmpeg(onProgress?: (progress: number) => void): Promise<FFmpeg> {
-  if (ffmpeg && ffmpeg.loaded) {
-    return ffmpeg;
-  }
-
-  ffmpeg = new FFmpeg();
-
-  ffmpeg.on('log', ({ message }) => {
-    console.log('[FFmpeg]', message);
-  });
-
-  ffmpeg.on('progress', ({ progress }) => {
-    if (onProgress) {
-      onProgress(Math.round(progress * 100));
-    }
-  });
-
-  // Load FFmpeg with CORS-enabled URLs
-  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-  });
-
-  return ffmpeg;
-}
+// Web Audio API-based compression (works in all browsers without special headers)
 
 export async function compressAudio(
   file: File,
   onProgress?: (progress: number) => void
 ): Promise<File> {
-  const ffmpegInstance = await loadFFmpeg(onProgress);
-
-  const inputName = 'input' + getExtension(file.name);
-  const outputName = 'output.mp3';
-
-  // Write input file to FFmpeg virtual filesystem
-  await ffmpegInstance.writeFile(inputName, await fetchFile(file));
-
-  // Compress to MP3 with reasonable quality settings
-  // -ac 1: mono (reduces size by ~50%)
-  // -ar 22050: lower sample rate (good enough for speech)
-  // -b:a 64k: 64kbps bitrate (good for speech)
-  await ffmpegInstance.exec([
-    '-i', inputName,
-    '-ac', '1',
-    '-ar', '22050',
-    '-b:a', '64k',
-    '-y',
-    outputName
-  ]);
-
-  // Read the compressed file
-  const data = await ffmpegInstance.readFile(outputName);
+  onProgress?.(10);
   
-  // Clean up
-  await ffmpegInstance.deleteFile(inputName);
-  await ffmpegInstance.deleteFile(outputName);
-
-  // Create a new File object - copy data to a new ArrayBuffer to avoid SharedArrayBuffer issues
-  const uint8Array = data as Uint8Array;
-  const newBuffer = new ArrayBuffer(uint8Array.byteLength);
-  new Uint8Array(newBuffer).set(uint8Array);
+  // Read the file as ArrayBuffer
+  const arrayBuffer = await file.arrayBuffer();
+  onProgress?.(20);
   
-  const compressedBlob = new Blob([newBuffer], { type: 'audio/mpeg' });
-  const compressedFile = new File(
-    [compressedBlob],
-    file.name.replace(/\.[^/.]+$/, '.mp3'),
-    { type: 'audio/mpeg' }
+  // Create audio context
+  const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+  
+  // Decode the audio
+  let audioBuffer: AudioBuffer;
+  try {
+    audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  } catch (error) {
+    console.error('Failed to decode audio:', error);
+    throw new Error('Unable to decode audio file. Please try a different format.');
+  }
+  onProgress?.(40);
+  
+  // Downsample to mono 22050Hz for speech
+  const targetSampleRate = 22050;
+  const offlineContext = new OfflineAudioContext(
+    1, // mono
+    Math.ceil(audioBuffer.duration * targetSampleRate),
+    targetSampleRate
   );
-
+  
+  const source = offlineContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(offlineContext.destination);
+  source.start(0);
+  
+  onProgress?.(50);
+  
+  const renderedBuffer = await offlineContext.startRendering();
+  onProgress?.(70);
+  
+  // Encode as WAV (widely supported, reasonable size for speech)
+  const wavBlob = encodeWAV(renderedBuffer);
+  onProgress?.(90);
+  
+  const compressedFile = new File(
+    [wavBlob],
+    file.name.replace(/\.[^/.]+$/, '.wav'),
+    { type: 'audio/wav' }
+  );
+  
+  onProgress?.(100);
+  
+  // Close the audio context
+  await audioContext.close();
+  
   return compressedFile;
 }
 
-function getExtension(filename: string): string {
-  const ext = filename.split('.').pop()?.toLowerCase();
-  return ext ? `.${ext}` : '.mp3';
+function encodeWAV(audioBuffer: AudioBuffer): Blob {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const format = 1; // PCM
+  const bitDepth = 16;
+  
+  const bytesPerSample = bitDepth / 8;
+  const blockAlign = numChannels * bytesPerSample;
+  
+  const samples = audioBuffer.getChannelData(0);
+  const dataLength = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(buffer);
+  
+  // WAV header
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataLength, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, format, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitDepth, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, dataLength, true);
+  
+  // Write audio data
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+    offset += 2;
+  }
+  
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function writeString(view: DataView, offset: number, string: string): void {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
 }
 
 export function formatFileSize(bytes: number): string {
