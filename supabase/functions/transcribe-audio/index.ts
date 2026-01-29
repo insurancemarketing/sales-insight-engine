@@ -30,25 +30,19 @@ serve(async (req) => {
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    console.log('Downloading audio file:', filePath);
+    console.log('Creating signed URL for audio file:', filePath);
 
-    // Download the audio file from storage
-    const { data: fileData, error: downloadError } = await supabase.storage
+    // Create a signed URL instead of downloading the file to avoid memory limits
+    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
       .from('call-recordings')
-      .download(filePath);
+      .createSignedUrl(filePath, 3600); // 1 hour expiry
 
-    if (downloadError || !fileData) {
-      console.error('Failed to download file:', downloadError);
-      throw new Error('Failed to download audio file');
+    if (signedUrlError || !signedUrlData?.signedUrl) {
+      console.error('Failed to create signed URL:', signedUrlError);
+      throw new Error('Failed to create signed URL for audio file');
     }
 
-    console.log('File downloaded, size:', fileData.size);
-
-    // For now, since we don't have a dedicated transcription service,
-    // we'll use Gemini's audio understanding capabilities
-    // Convert the audio to base64
-    const arrayBuffer = await fileData.arrayBuffer();
-    const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+    console.log('Signed URL created successfully');
 
     // Determine MIME type from file extension
     const extension = filePath.split('.').pop()?.toLowerCase() || 'mp3';
@@ -62,9 +56,10 @@ serve(async (req) => {
     };
     const mimeType = mimeTypes[extension] || 'audio/mpeg';
 
-    console.log('Sending to AI for transcription...');
+    console.log('Sending to AI for transcription with URL...');
 
     // Use Gemini to transcribe (it has audio understanding)
+    // Using URL-based input to avoid memory limits
     const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -82,10 +77,9 @@ serve(async (req) => {
                 text: 'Please transcribe this audio recording of a sales call. Format it as a conversation with speaker labels (Agent/Client) where you can distinguish speakers. Include all dialogue faithfully. If you cannot determine who is speaking, use "Speaker 1" and "Speaker 2". Provide only the transcript without any additional commentary.'
               },
               {
-                type: 'input_audio',
-                input_audio: {
-                  data: base64Audio,
-                  format: extension === 'wav' ? 'wav' : 'mp3'
+                type: 'audio_url',
+                audio_url: {
+                  url: signedUrlData.signedUrl
                 }
               }
             ]
