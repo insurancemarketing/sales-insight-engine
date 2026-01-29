@@ -1,99 +1,145 @@
 
-## What’s happening (why you’re seeing “Transcription failed: 400”)
+# Switch to Your Own Google Gemini API Key
 
-Your backend function `transcribe-audio` downloads the audio file (or WAV chunk), converts it to Base64, then sends it to Lovable AI as `input_audio`.
-
-Right now the Base64 encoding logic is **incorrect**:
-
-- It Base64-encodes the audio **in multiple independent pieces** using `btoa(...)`
-- Then it **concatenates those Base64 strings**
-- Concatenating separately-encoded Base64 segments does **not** produce valid Base64 for the full file
-
-So the AI provider receives a Base64 string that looks “mostly right” but has invalid padding/structure in the middle → provider rejects it with HTTP 400 → your function returns 500 with `Transcription failed: 400`.
-
-This matches the earlier log you had:
-> “Base64 decoding failed … inline_data.data …”
-
-## Goals
-
-1. Fix the Base64 encoding so the audio payload is valid.
-2. Prevent “too big once Base64’d” issues by keeping chunks safely below the AI request limit.
-3. Improve error messaging so you get actionable details if the provider rejects input again.
+This plan will change the transcription and analysis functions to use your own Google Gemini API key directly, giving you full control over billing and removing dependency on Lovable credits.
 
 ---
 
-## Implementation plan (code changes)
+## Overview
 
-### 1) Fix Base64 encoding in `supabase/functions/transcribe-audio/index.ts`
+Currently, both `transcribe-audio` and `analyze-call` functions route through the Lovable AI Gateway using `LOVABLE_API_KEY`. We'll switch them to call Google's Gemini API directly using your personal API key.
 
-**Change:** Replace the current chunked `btoa(String.fromCharCode(...chunk))` loop with a real Base64 encoder that works on bytes.
+### Benefits
+- **Direct billing control** - Pay Google directly, no middleman
+- **Free tier access** - Google offers ~1,500 requests/day free for Gemini Flash
+- **Higher rate limits** - No shared workspace limits
+- **Cost savings** - Using Gemini 2.5 Flash instead of Pro reduces costs by 60-70%
 
-**Approach:**
-- Import Deno’s standard base64 encoder:
-  - `import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";`
-- After `const arrayBuffer = await fileData.arrayBuffer()`:
-  - `const base64Audio = base64Encode(new Uint8Array(arrayBuffer));`
+---
 
-**Why this fixes it:**
-- The encoder produces a single valid Base64 string for the entire byte array (no broken padding, no concatenation artifacts).
+## Step 1: Get Your Google Gemini API Key
 
-### 2) Adjust the “max segment size” rule to account for Base64 expansion
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
+2. Sign in with your Google account
+3. Click "Create API Key"
+4. Copy the key (starts with `AIza...`)
 
-Base64 makes payloads ~33% larger. A “9.5MB WAV chunk” becomes ~12.7MB Base64, which can cause provider or gateway request-size errors (often 400/413-like failures).
+### Free Tier Limits (Gemini 2.5 Flash)
+- **15 requests per minute** (RPM)
+- **1 million tokens per minute** (TPM)
+- **1,500 requests per day** (RPD)
 
-**Change in `transcribe-audio`:**
-- Lower the segment size limit from `10MB` to something safer (example: `6–7MB`), and return a clear error message like:
-  - “Segment too large after encoding. Please re-upload or let us re-chunk into smaller parts.”
+For most use cases, the free tier should cover your needs. Beyond that, pricing is very affordable.
 
-This prevents silently sending oversized payloads that are likely to fail.
+---
 
-### 3) Update client-side chunk target sizing so the produced WAV chunks stay under the new safe threshold
+## Step 2: Add the Secret
 
-In `src/pages/UploadCall.tsx`, you currently call:
+I'll prompt you to add a secret called `GOOGLE_GEMINI_API_KEY` where you'll paste your API key.
 
-```ts
-targetBytes: MAX_SIZE_FOR_DIRECT_UPLOAD - 512 * 1024
+---
+
+## Step 3: Update transcribe-audio Function
+
+### Changes
+1. Replace `LOVABLE_API_KEY` with `GOOGLE_GEMINI_API_KEY`
+2. Change endpoint from `https://ai.gateway.lovable.dev/v1/chat/completions` to `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`
+3. Switch model from `gemini-2.5-pro` to `gemini-2.5-flash` (faster & cheaper)
+4. Adapt the request format to Google's native API structure
+5. Update error handling for Google API responses
+
+### API Format Difference
+```text
+Current (OpenAI-compatible):
+POST /v1/chat/completions
+Authorization: Bearer {key}
+{ "model": "...", "messages": [...] }
+
+Google Native:
+POST /v1beta/models/{model}:generateContent?key={key}
+{ "contents": [...], "generationConfig": {...} }
 ```
 
-That aims for just under 10MB, which is risky once Base64’d.
+---
 
-**Change:**
-- Set `targetBytes` to a safer value (example: ~6MB) when preparing audio:
-  - `targetBytes: 6 * 1024 * 1024` (or similar)
+## Step 4: Update analyze-call Function
 
-**Outcome:**
-- Each WAV chunk stays small enough that Base64’d audio remains within request limits, dramatically reducing provider rejection.
-
-### 4) Improve error visibility from the AI provider (still in `transcribe-audio`)
-
-Right now when AI responds with non-OK, you log text and throw `Transcription failed: ${status}`.
-
-**Change:**
-- Include a short, non-sensitive snippet of the provider response in the thrown error (or map it to a user-friendly message).
-- Specifically detect the “invalid base64” case and return a clearer message (helps confirm we truly fixed it if it ever resurfaces).
-
-### 5) Verification steps (what you should do after we implement)
-
-1. Upload a file that previously failed (same one).
-2. Confirm the UI progresses past “Transcribing audio…”.
-3. If it’s a long call, confirm chunked upload completes and transcription returns a full transcript (joined segments).
-4. If there’s still an error, check the backend logs for:
-   - response status
-   - provider message snippet
-   - segment size and encoded length (we’ll log these safely)
+### Changes
+1. Same endpoint and authentication updates as transcribe-audio
+2. Switch to `gemini-2.5-flash` model
+3. Adapt request/response format for Google's native API
+4. Update error handling
 
 ---
 
-## Optional fallback (only if needed)
+## Step 5: Keep Fallback (Optional)
 
-If the AI provider remains picky about WAV input:
-- We can switch the prepared chunks to **compressed MP3** (still chunked) to cut payload size drastically.
-- That requires client-side encoding changes (more complexity), so I’d only do this if the “safe WAV chunk size + correct Base64” still hits limits.
+We can optionally keep `LOVABLE_API_KEY` as a fallback if `GOOGLE_GEMINI_API_KEY` isn't configured, but the primary path will use your key.
 
 ---
 
-## Clarifying question (to ensure we test the right path)
+## Technical Details
 
-- Is this failing for **all uploads**, or only when the app uses the **chunked manifest** flow (large files over 10MB)?
-  - Either way, the Base64 fix is required, but it helps confirm whether request-size limits are also part of the problem.
+### New API Call Structure (transcribe-audio)
 
+```text
+Endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
+
+Request body:
+{
+  "contents": [{
+    "parts": [
+      { "text": "Transcribe this audio..." },
+      { "inlineData": { "mimeType": "audio/wav", "data": "<base64>" } }
+    ]
+  }],
+  "generationConfig": {
+    "temperature": 0.1
+  }
+}
+
+Response:
+{
+  "candidates": [{
+    "content": {
+      "parts": [{ "text": "transcription here" }]
+    }
+  }]
+}
+```
+
+### Error Codes to Handle
+- `400` - Invalid request (bad audio format, too large)
+- `403` - Invalid API key
+- `429` - Rate limit exceeded
+- `500` - Google server error
+
+---
+
+## Cost Comparison
+
+| Model | Input Cost | Output Cost | 10-min call | 1-hour call |
+|-------|------------|-------------|-------------|-------------|
+| Gemini 2.5 Pro (current) | $1.25/1M tokens | $10.00/1M tokens | ~$0.04 | ~$0.25 |
+| Gemini 2.5 Flash (new) | $0.075/1M tokens | $0.30/1M tokens | ~$0.01 | ~$0.06 |
+
+**Savings: ~75% per call**
+
+---
+
+## Files to Modify
+
+1. **supabase/functions/transcribe-audio/index.ts** - Update API endpoint, auth, and request format
+2. **supabase/functions/analyze-call/index.ts** - Update API endpoint, auth, and request format
+
+---
+
+## After Implementation
+
+Once approved, I'll:
+1. Ask you to add your `GOOGLE_GEMINI_API_KEY` secret
+2. Update both edge functions
+3. Deploy the changes
+4. You can test by uploading a call recording
+
+The app will then use your Google API key directly with no Lovable credit consumption.
