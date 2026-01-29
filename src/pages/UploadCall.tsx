@@ -18,11 +18,16 @@ import {
   X,
   Loader2,
   CheckCircle,
-  AlertCircle
+  AlertCircle,
+  Zap
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { compressAudio, formatFileSize } from '@/lib/audioCompression';
 
-type UploadStep = 'upload' | 'details' | 'processing' | 'complete' | 'error';
+type UploadStep = 'upload' | 'details' | 'compressing' | 'processing' | 'complete' | 'error';
+
+const MAX_SIZE_FOR_DIRECT_UPLOAD = 10 * 1024 * 1024; // 10MB
+const MAX_SIZE_FOR_COMPRESSION = 100 * 1024 * 1024; // 100MB
 
 export default function UploadCall() {
   const { user } = useAuth();
@@ -31,11 +36,14 @@ export default function UploadCall() {
   
   const [step, setStep] = useState<UploadStep>('upload');
   const [file, setFile] = useState<File | null>(null);
+  const [originalFile, setOriginalFile] = useState<File | null>(null);
   const [clientName, setClientName] = useState('');
   const [notes, setNotes] = useState('');
   const [progress, setProgress] = useState(0);
+  const [compressionProgress, setCompressionProgress] = useState(0);
   const [callId, setCallId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [needsCompression, setNeedsCompression] = useState(false);
 
   const onDrop = useCallback((acceptedFiles: File[], rejectedFiles: any[]) => {
     if (rejectedFiles.length > 0) {
@@ -44,13 +52,23 @@ export default function UploadCall() {
         toast({
           variant: 'destructive',
           title: 'File too large',
-          description: 'Please upload audio files under 10MB. Try compressing or trimming your recording.',
+          description: 'Maximum file size is 100MB.',
         });
       }
       return;
     }
     if (acceptedFiles.length > 0) {
-      setFile(acceptedFiles[0]);
+      const selectedFile = acceptedFiles[0];
+      setOriginalFile(selectedFile);
+      
+      // Check if compression is needed
+      if (selectedFile.size > MAX_SIZE_FOR_DIRECT_UPLOAD) {
+        setNeedsCompression(true);
+        setFile(selectedFile);
+      } else {
+        setNeedsCompression(false);
+        setFile(selectedFile);
+      }
       setStep('details');
     }
   }, [toast]);
@@ -61,25 +79,47 @@ export default function UploadCall() {
       'audio/*': ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4'],
     },
     maxFiles: 1,
-    maxSize: 10 * 1024 * 1024, // 10MB limit due to edge function constraints
+    maxSize: MAX_SIZE_FOR_COMPRESSION,
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!file || !user) return;
 
-    setStep('processing');
-    setProgress(0);
+    let fileToUpload = file;
 
     try {
+      // Step 0: Compress if needed
+      if (needsCompression) {
+        setStep('compressing');
+        setCompressionProgress(0);
+        
+        toast({
+          title: 'Compressing audio...',
+          description: 'This may take a moment for large files.',
+        });
+
+        fileToUpload = await compressAudio(file, (prog) => {
+          setCompressionProgress(prog);
+        });
+
+        toast({
+          title: 'Compression complete!',
+          description: `Reduced from ${formatFileSize(file.size)} to ${formatFileSize(fileToUpload.size)}`,
+        });
+      }
+
+      setStep('processing');
+      setProgress(0);
+
       // Step 1: Upload file to storage
       setProgress(10);
-      const fileExt = file.name.split('.').pop();
+      const fileExt = fileToUpload.name.split('.').pop();
       const filePath = `${user.id}/${Date.now()}.${fileExt}`;
 
       const { error: uploadError } = await supabase.storage
         .from('call-recordings')
-        .upload(filePath, file);
+        .upload(filePath, fileToUpload);
 
       if (uploadError) throw uploadError;
 
@@ -91,7 +131,7 @@ export default function UploadCall() {
         .insert({
           user_id: user.id,
           file_path: filePath,
-          file_name: file.name,
+          file_name: originalFile?.name || file.name,
           client_name: clientName || null,
           status: 'pending',
         })
@@ -146,12 +186,15 @@ export default function UploadCall() {
 
   const resetUpload = () => {
     setFile(null);
+    setOriginalFile(null);
     setClientName('');
     setNotes('');
     setStep('upload');
     setProgress(0);
+    setCompressionProgress(0);
     setError(null);
     setCallId(null);
+    setNeedsCompression(false);
   };
 
   return (
@@ -169,7 +212,7 @@ export default function UploadCall() {
             <CardHeader>
               <CardTitle className="font-display">Select Recording</CardTitle>
               <CardDescription>
-                Supported formats: MP3, WAV, M4A, OGG, WebM (max 10MB)
+                Supported formats: MP3, WAV, M4A, OGG, WebM (up to 100MB with auto-compression)
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -225,7 +268,13 @@ export default function UploadCall() {
                   <div className="flex-1 min-w-0">
                     <p className="font-medium truncate">{file.name}</p>
                     <p className="text-sm text-muted-foreground">
-                      {(file.size / (1024 * 1024)).toFixed(2)} MB
+                      {formatFileSize(file.size)}
+                      {needsCompression && (
+                        <span className="ml-2 text-primary">
+                          <Zap className="w-3 h-3 inline mr-1" />
+                          Will be compressed
+                        </span>
+                      )}
                     </p>
                   </div>
                   <Button
@@ -237,6 +286,18 @@ export default function UploadCall() {
                     <X className="w-4 h-4" />
                   </Button>
                 </div>
+
+                {needsCompression && (
+                  <div className="p-4 rounded-lg bg-primary/5 border border-primary/20">
+                    <div className="flex items-center gap-2 text-sm">
+                      <Zap className="w-4 h-4 text-primary" />
+                      <span className="font-medium text-primary">Auto-compression enabled</span>
+                    </div>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      Your file exceeds 10MB and will be compressed before upload. This preserves audio quality while reducing size.
+                    </p>
+                  </div>
+                )}
 
                 <div className="space-y-2">
                   <Label htmlFor="clientName">Client/Prospect Name</Label>
@@ -265,10 +326,30 @@ export default function UploadCall() {
                   </Button>
                   <Button type="submit" className="flex-1">
                     <Upload className="w-4 h-4 mr-2" />
-                    Upload & Analyze
+                    {needsCompression ? 'Compress & Analyze' : 'Upload & Analyze'}
                   </Button>
                 </div>
               </form>
+            </CardContent>
+          </Card>
+        )}
+
+        {step === 'compressing' && (
+          <Card>
+            <CardContent className="pt-8 pb-8">
+              <div className="text-center">
+                <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-6">
+                  <Zap className="w-8 h-8 text-primary animate-pulse" />
+                </div>
+                <h3 className="text-xl font-display font-semibold mb-2">
+                  Compressing audio...
+                </h3>
+                <p className="text-muted-foreground mb-6">
+                  Optimizing your recording for analysis
+                </p>
+                <Progress value={compressionProgress} className="h-2" />
+                <p className="text-sm text-muted-foreground mt-2">{compressionProgress}%</p>
+              </div>
             </CardContent>
           </Card>
         )}
