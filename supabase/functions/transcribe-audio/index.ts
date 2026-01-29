@@ -30,36 +30,56 @@ serve(async (req) => {
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    console.log('Creating signed URL for audio file:', filePath);
+    console.log('Downloading audio file:', filePath);
 
-    // Create a signed URL instead of downloading the file to avoid memory limits
-    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
+    // Download the audio file from storage
+    const { data: fileData, error: downloadError } = await supabase.storage
       .from('call-recordings')
-      .createSignedUrl(filePath, 3600); // 1 hour expiry
+      .download(filePath);
 
-    if (signedUrlError || !signedUrlData?.signedUrl) {
-      console.error('Failed to create signed URL:', signedUrlError);
-      throw new Error('Failed to create signed URL for audio file');
+    if (downloadError || !fileData) {
+      console.error('Failed to download file:', downloadError);
+      throw new Error('Failed to download audio file');
     }
 
-    console.log('Signed URL created successfully');
+    const fileSize = fileData.size;
+    console.log('File downloaded, size:', fileSize, 'bytes');
 
-    // Determine MIME type from file extension
+    // Check file size - edge functions have memory limits
+    // For files larger than 10MB, we need to warn
+    if (fileSize > 10 * 1024 * 1024) {
+      throw new Error('Audio file is too large. Please upload files under 10MB.');
+    }
+
+    // Convert the audio to base64 - use chunked approach to avoid memory issues
+    const arrayBuffer = await fileData.arrayBuffer();
+    const uint8Array = new Uint8Array(arrayBuffer);
+    
+    // Convert to base64 in chunks to avoid memory issues
+    let base64Audio = '';
+    const chunkSize = 32768; // 32KB chunks
+    for (let i = 0; i < uint8Array.length; i += chunkSize) {
+      const chunk = uint8Array.slice(i, Math.min(i + chunkSize, uint8Array.length));
+      base64Audio += btoa(String.fromCharCode(...chunk));
+    }
+
+    console.log('Base64 encoded, length:', base64Audio.length);
+
+    // Determine format from file extension
     const extension = filePath.split('.').pop()?.toLowerCase() || 'mp3';
-    const mimeTypes: Record<string, string> = {
-      'mp3': 'audio/mpeg',
-      'wav': 'audio/wav',
-      'webm': 'audio/webm',
-      'm4a': 'audio/mp4',
-      'ogg': 'audio/ogg',
-      'mp4': 'audio/mp4',
+    const formatMap: Record<string, string> = {
+      'mp3': 'mp3',
+      'wav': 'wav',
+      'webm': 'webm',
+      'm4a': 'mp3', // Gemini treats m4a as mp3 format
+      'ogg': 'ogg',
+      'mp4': 'mp3',
     };
-    const mimeType = mimeTypes[extension] || 'audio/mpeg';
+    const format = formatMap[extension] || 'mp3';
 
-    console.log('Sending to AI for transcription with URL...');
+    console.log('Sending to AI for transcription, format:', format);
 
-    // Use Gemini to transcribe (it has audio understanding)
-    // Using URL-based input to avoid memory limits
+    // Use Gemini to transcribe with proper input_audio format
     const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -74,12 +94,13 @@ serve(async (req) => {
             content: [
               {
                 type: 'text',
-                text: 'Please transcribe this audio recording of a sales call. Format it as a conversation with speaker labels (Agent/Client) where you can distinguish speakers. Include all dialogue faithfully. If you cannot determine who is speaking, use "Speaker 1" and "Speaker 2". Provide only the transcript without any additional commentary.'
+                text: 'Please transcribe this audio recording word-for-word. This is a sales call recording. Format it as a conversation with speaker labels where you can distinguish speakers. Use the actual names mentioned in the conversation for speaker labels. Include all dialogue faithfully and accurately. Do not make up or invent any content - only transcribe what you actually hear in the audio. Provide only the transcript without any additional commentary.'
               },
               {
-                type: 'audio_url',
-                audio_url: {
-                  url: signedUrlData.signedUrl
+                type: 'input_audio',
+                input_audio: {
+                  data: base64Audio,
+                  format: format
                 }
               }
             ]
